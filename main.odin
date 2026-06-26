@@ -5,34 +5,41 @@
 package main
 
 import "core:mem"
+import "core:strings"
 import "core:fmt"
-import win32 "core:sys/windows"
+import "core:os"
+import "core:bytes"
+import "core:io"
 
+Max_Maps :: 16 // or whatever
 Position :: distinct [2]int
 Max_Entities :: 64
 Max_Map_Width :: 80
-Max_Map_Height :: 20
+Max_Map_Height :: 80
 
 Game_State :: struct {
     num_entities: u32,
     num_boxes: u32,
+    num_exits: u32,
     entities: [Max_Entities]Entity,
     wall_data: [Max_Map_Width*Max_Map_Height]u8,
     entity_map: [Max_Map_Width*Max_Map_Height]int,
     map_data: ^Map_Data,
     player: ^Entity, // short hand to get into the entity map, we always want to "do move" from the player entity out
-    moves: int
+    moves: int,
+    solved: bool
 }
 
 Map_Data :: struct {
     width, height: int,
-    data: []u8
+    data: [Max_Map_Width*Max_Map_Height]u8
 }
 
 Entity_Type :: enum {
     Player,
     Box,
-    Goal
+    Goal,
+    Exit,
 }
 
 Entity_Flags :: enum {
@@ -51,22 +58,56 @@ Entity :: struct {
     enabled: bool
 }
 
-// #####
-// # ! #
-// # % #
-// # @ #
-// #####
+load_map :: proc(path: string) -> (bool, Map_Data) {
+    if !os.exists(path) {
+        return false, {}
+    }
 
-Test_Map := Map_Data {
-    width = 7,
-    height = 7,
-    data = { '#', '#', '#', '#', '#', '#', '#',
-             '#', ' ', '!', ' ', ' ', ' ', '#',
-             '#', ' ', ' ', ' ', ' ', ' ', '#',
-             '#', ' ', '%', '%', ' ', ' ', '#', 
-             '#', ' ', '%', ' ', ' ', ' ', '#',
-             '#', ' ', '@', ' ', ' ', ' ', '#',
-             '#', '#', '#', '#', '#', '#', '#'}
+    f, err := os.open(path)
+
+    if err != nil {
+        return false, {}
+    }
+
+    data: []byte
+    data, err = os.read_entire_file(f, context.allocator)
+
+    if err != nil {
+        return false, {}
+    }
+
+    defer delete(data)
+
+    str := cast(string)data
+
+    max_len := -1
+    line_num := 0
+    map_data: Map_Data
+    map_data.data = ' '
+
+    for line in strings.split_lines_iterator(&str) {
+        if max_len < 0 || max_len < len(line) {
+            max_len = len(line)
+        }
+
+        if len(line) >= Max_Map_Width {
+            fmt.eprintfln("Level data must be less than %d long per line.", Max_Map_Width)
+            return false, {}
+        }
+
+        c_count := 0
+        for c in line {
+            map_data.data[grid_index(c_count, line_num, Max_Map_Width)] = cast(u8)c
+            c_count += 1
+        }
+
+        line_num += 1
+    }
+
+    map_data.width = max_len
+    map_data.height = line_num
+
+    return true, map_data
 }
 
 grid_index_xy :: #force_inline proc(x, y, width: int) -> int {
@@ -95,15 +136,25 @@ new_entity :: proc(g: ^Game_State, type: Entity_Type, position: Position, flags:
     e.overlapped_id = -1
     e.enabled = false
 
-    g.entity_map[grid_index(position, g.map_data.width)] = e.id
+    g.entity_map[grid_index(position, Max_Map_Width)] = e.id
     g.num_entities += 1
 
     if type == .Box {
         g.num_boxes += 1
+    } else if type == .Exit {
+        g.num_exits += 1
     }
 
 
     return e
+}
+
+update_exits :: proc(g: ^Game_State) {
+    for i in 0..<g.num_entities {
+        if g.entities[i].type == .Exit {
+            g.entities[i].flags = { .Overlapped } if g.solved else {}
+        }
+    }
 }
 
 init_map :: proc(m: ^Map_Data, g: ^Game_State) {
@@ -118,11 +169,12 @@ init_map :: proc(m: ^Map_Data, g: ^Game_State) {
 
     for y in 0..<m.height {
         for x in 0..<m.width {
-            idx := grid_index(x, y, m.width)
+            idx := grid_index(x, y, Max_Map_Width)
             switch m.data[idx] {
                 case '#': g.wall_data[idx] = '#'
-                case '!': new_entity(g, .Goal, {x, y}, { .Overlapped })
-                case '%': new_entity(g, .Box, {x, y})
+                case 'x': new_entity(g, .Exit, { x, y} , {})
+                case '.': new_entity(g, .Goal, {x, y}, { .Overlapped })
+                case '$': new_entity(g, .Box, {x, y})
                 case '@': g.player = new_entity(g, .Player, {x, y})
                 case:
             }
@@ -133,15 +185,17 @@ init_map :: proc(m: ^Map_Data, g: ^Game_State) {
 draw_map :: proc(g: ^Game_State) {
     fmt.print("\x1b[2J")
 
-    for y in 0..<g.map_data.width {
-        for x in 0..<g.map_data.height {
-            idx := grid_index(x, y, g.map_data.width)
-            yy := y + 1
-            xx := x + 1
+    tdims := terminal_dimensions()
+
+    for y in 0..<g.map_data.height {
+        for x in 0..<g.map_data.width {
+            idx := grid_index(x, y, Max_Map_Width)
+            xx := (tdims[0] / 2) - g.map_data.width + x + 1
+            yy := (tdims[1] / 2) - g.map_data.height + y + 1
 
             // Draw walls:
             if g.wall_data[idx] == '#' {
-                fmt.printf("\x1b[%d;%dH#", yy, xx)
+                fmt.printf("\x1b[%d;%dH\x1b[48;2;150;41;56m\x1b[38;2;100;100;100m#\x1b[39m\x1b[49m", yy, xx)
             }
 
             // entities:
@@ -153,18 +207,25 @@ draw_map :: proc(g: ^Game_State) {
 
             if e != nil {
                 switch e.type {
-                    case .Player: fmt.printf("\x1b[%d;%dH@", yy, xx)
-                    case .Box: fmt.printf("\x1b[%d;%dH%%", yy, xx)
-                    case .Goal: fmt.printf("\x1b[%d;%dH!", yy, xx)
+                    case .Player: fmt.printf("\x1b[%d;%dH\x1b[38;2;128;0;128m@\x1b[39m\x1b[49m", yy, xx)
+                    case .Box: fmt.printf("\x1b[%d;%dH\x1b[38;2;164;116;73m\x1b[48;2;78;53;36m%%\x1b[39m\x1b[49m", yy, xx)
+                    case .Goal: fmt.printf("\x1b[%d;%dH\x1b[38;2;255;165;0m!\x1b[39m\x1b[49m", yy, xx)
+                    case .Exit: {
+                        if g.solved {
+                            fmt.printf("\x1b[%d;%dH\x1b[48;2;128;0;128m\x1b[38;2;255;215;0mx\x1b[39m\x1b[49m", yy, xx)
+                        }  else {
+                            fmt.printf("\x1b[%d;%dH\x1b[48;2;150;41;56m\x1b[38;2;100;100;100m#\x1b[39m\x1b[49m", yy, xx)
+                        }
+                    }
                 }
             }
         }
     }
 }
 
-do_move :: proc(e: ^Entity, g: ^Game_State, x_move: int, y_move: int) -> bool {
+do_move :: proc(e: ^Entity, g: ^Game_State, x_move: int, y_move: int, f: ^Entity) -> bool {
     move_pos := e.position + { x_move, y_move } 
-    move_index :=  grid_index(move_pos, g.map_data.width)
+    move_index :=  grid_index(move_pos, Max_Map_Width)
 
     if .Overlapped in e.flags {
         return true
@@ -174,26 +235,34 @@ do_move :: proc(e: ^Entity, g: ^Game_State, x_move: int, y_move: int) -> bool {
         return false
     }
 
-    if move_index < 0 || move_index >= g.map_data.width * g.map_data.height {
+    if move_index < 0 || move_index >= Max_Map_Width * Max_Map_Height {
         return false
     }
 
-    if g.wall_data[move_index] == '#' {
+    if g.wall_data[move_index] == '#' || (g.wall_data[move_index] == 'x' && !g.solved) {
+        return false
+    }
+
+    if e.type == .Box && f.type != .Player {
         return false
     }
 
     entity_id := g.entity_map[move_index]
 
     if entity_id >= 0 {
-        if !do_move(&g.entities[entity_id], g, x_move, y_move) {
+        if !do_move(&g.entities[entity_id], g, x_move, y_move, e) {
             return false
         }
     }
 
-    old_grid_idx := grid_index(e.position, g.map_data.width)
+    old_grid_idx := grid_index(e.position, Max_Map_Width)
 
     // if we've overlapped an entity previously, we set the current pos to that overlapped id,
     // and if we're about to overlap an entity, we store that as the new overlap id
+    if e.overlapped_id > -1 {
+        g.entities[e.overlapped_id].enabled = false
+    }
+
     g.entity_map[old_grid_idx] = e.overlapped_id
     e.overlapped_id = g.entity_map[move_index]
 
@@ -207,51 +276,31 @@ do_move :: proc(e: ^Entity, g: ^Game_State, x_move: int, y_move: int) -> bool {
 }
 
 main :: proc() {
-    std_in_handle := win32.GetStdHandle(win32.STD_INPUT_HANDLE)
-    std_out_handle := win32.GetStdHandle(win32.STD_OUTPUT_HANDLE)
-
-    console_mode: u32
-
-    win32.GetConsoleMode(std_out_handle, &console_mode)
-    win32.SetConsoleMode(std_out_handle, console_mode | win32.ENABLE_VIRTUAL_TERMINAL_PROCESSING)
-
     state: Game_State
     quit := false
     win := false
 
-    init_map(&Test_Map, &state)
+    map_ok, test_map := load_map("levels/test.txt")
+
+    if !map_ok {
+        fmt.eprintln("Failed to load test map.")
+        return
+    }
+
+    init_terminal()
+
+    init_map(&test_map, &state)
 
     fmt.print("\x1b[?1049h\x1b[?25l")
-    input_record_buf: [32]win32.INPUT_RECORD
-    input_event_count: u32
 
     for !quit {
         draw_map(&state)
 
-        win32.ReadConsoleInputW(std_in_handle, &input_record_buf[0], len(input_record_buf), &input_event_count)
-
-        if input_event_count > 0 {
-            for i in 0..<input_event_count {
-                #partial switch input_record_buf[i].EventType {
-                    case .KEY_EVENT:
-                        key_event := input_record_buf[i].Event.KeyEvent
-
-                        if key_event.bKeyDown == false do continue
-                        if key_event.wRepeatCount > 1 do continue
-
-                        switch key_event.wVirtualKeyCode {
-                            case win32.VK_ESCAPE: quit = true
-                            case win32.VK_UP: if do_move(state.player, &state, 0, -1) do state.moves += 1
-                            case win32.VK_DOWN: if do_move(state.player, &state, 0, 1) do state.moves += 1
-                            case win32.VK_LEFT: if do_move(state.player, &state, -1, 0) do state.moves += 1
-                            case win32.VK_RIGHT: if do_move(state.player, &state, 1, 0) do state.moves += 1
-                            case win32.VK_R: init_map(&Test_Map, &state)
-                            case:
-                        }
-                    case:
-                }
-            }
+        if !process_keys(&state) {
+            quit = true
         }
+
+        update_exits(&state)
 
         all_goals_enabled := true
         for i in 0..<state.num_entities {
@@ -261,15 +310,31 @@ main :: proc() {
         }
 
         if all_goals_enabled {
-            win = true
-            quit = true
+            state.solved = true
+
+            if state.num_exits == 0 {
+                win = true
+                quit = true
+            }
+        } else {
+            state.solved = false
+        }
+
+        if state.num_exits > 0 && state.player.overlapped_id > -1 {
+            if state.entities[state.player.overlapped_id].type == .Exit {
+                win = true
+                quit = true
+            }
         }
     }
 
+    // clear all formatting:
+    fmt.print("\x1b[39m\x1b[49m")
     fmt.print("\x1b[?1049l")
-    win32.SetConsoleMode(std_out_handle, console_mode)
+
+    quit_terminal()
 
     if win {
-        fmt.println("Winner!")
+        fmt.print("Winner!")
     }
 }
