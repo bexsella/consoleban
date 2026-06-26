@@ -26,7 +26,7 @@ quit_terminal :: proc() {
     win32.SetConsoleMode(std_out_handle, console_mode)
 }
 
-process_keys :: proc(state: ^Game_State) -> bool {
+process_keys :: proc(input: ^Input) -> bool {
     input_record_buf: [32]win32.INPUT_RECORD
     input_event_count: u32
 
@@ -42,12 +42,13 @@ process_keys :: proc(state: ^Game_State) -> bool {
                     if key_event.wRepeatCount > 1 do continue
 
                     switch key_event.wVirtualKeyCode {
-                        case win32.VK_ESCAPE: return false
-                        case win32.VK_UP: if    do_move(state.player, state, 0, -1, nil) { state.moves += 1 } else { fmt.print("\a") }
-                        case win32.VK_DOWN: if  do_move(state.player, state, 0, 1, nil) { state.moves += 1 } else { fmt.print("\a") }
-                        case win32.VK_LEFT: if  do_move(state.player, state, -1, 0, nil) { state.moves += 1 } else { fmt.print("\a") }
-                        case win32.VK_RIGHT: if do_move(state.player, state, 1, 0, nil) { state.moves += 1 } else { fmt.print("\a") }
-                        case win32.VK_R: init_map(state.map_data, state)
+                        case win32.VK_ESCAPE: input.quit = true
+                        case win32.VK_UP: input.up = true
+                        case win32.VK_DOWN: input.down = true
+                        case win32.VK_LEFT: input.left = true
+                        case win32.VK_RIGHT: input.right = true
+                        case win32.VK_R: input.reset = true
+                        case win32.VK_Z: input.undo = true
                         case:
                     }
                 case:

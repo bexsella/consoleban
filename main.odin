@@ -4,18 +4,29 @@
 // 
 package main
 
+import "core:math/linalg"
 import "core:mem"
+import "core:mem/virtual"
 import "core:strings"
 import "core:fmt"
 import "core:os"
-import "core:bytes"
-import "core:io"
 
 Max_Maps :: 16 // or whatever
 Position :: distinct [2]int
 Max_Entities :: 64
 Max_Map_Width :: 80
 Max_Map_Height :: 80
+
+// do this better, probably
+Input :: struct {
+    up: bool,
+    down: bool,
+    left: bool,
+    right: bool,
+    reset: bool,
+    undo: bool,
+    quit: bool
+}
 
 Game_State :: struct {
     num_entities: u32,
@@ -31,7 +42,7 @@ Game_State :: struct {
 }
 
 Map_Data :: struct {
-    width, height: int,
+    width, height: int, // largest width and height of the map row and column
     data: [Max_Map_Width*Max_Map_Height]u8
 }
 
@@ -57,6 +68,12 @@ Entity :: struct {
     overlapped_id: int,
     enabled: bool
 }
+
+// 
+persistent_arena: virtual.Arena
+persistent_allocator: mem.Allocator
+history_states: [dynamic]Game_State
+current_state: Game_State
 
 load_map :: proc(path: string) -> (bool, Map_Data) {
     if !os.exists(path) {
@@ -180,6 +197,9 @@ init_map :: proc(m: ^Map_Data, g: ^Game_State) {
             }
         }
     }
+
+    // we store a known playable state
+    append(&history_states, g^)
 }
 
 draw_map :: proc(g: ^Game_State) {
@@ -223,8 +243,17 @@ draw_map :: proc(g: ^Game_State) {
     }
 }
 
-do_move :: proc(e: ^Entity, g: ^Game_State, x_move: int, y_move: int, f: ^Entity) -> bool {
-    move_pos := e.position + { x_move, y_move } 
+pop_state :: proc() {
+    if len(history_states) == 1 {
+        current_state = history_states[0]
+        return
+    }
+
+    current_state = pop(&history_states)
+}
+
+do_move :: proc(e: ^Entity, g: ^Game_State, move_dir: Position, f: ^Entity) -> bool {
+    move_pos := e.position + move_dir 
     move_index :=  grid_index(move_pos, Max_Map_Width)
 
     if .Overlapped in e.flags {
@@ -250,7 +279,7 @@ do_move :: proc(e: ^Entity, g: ^Game_State, x_move: int, y_move: int, f: ^Entity
     entity_id := g.entity_map[move_index]
 
     if entity_id >= 0 {
-        if !do_move(&g.entities[entity_id], g, x_move, y_move, e) {
+        if !do_move(&g.entities[entity_id], g, move_dir, e) {
             return false
         }
     }
@@ -272,13 +301,23 @@ do_move :: proc(e: ^Entity, g: ^Game_State, x_move: int, y_move: int, f: ^Entity
 
     e.position = move_pos
     g.entity_map[move_index] = e.id
+
     return true
 }
 
 main :: proc() {
-    state: Game_State
     quit := false
     win := false
+
+    alloc_err := virtual.arena_init_growing(&persistent_arena)
+
+    if alloc_err != nil {
+        return
+    }
+
+    persistent_allocator = virtual.arena_allocator(&persistent_arena)
+
+    history_states = make([dynamic]Game_State)
 
     map_ok, test_map := load_map("levels/test.txt")
 
@@ -289,39 +328,72 @@ main :: proc() {
 
     init_terminal()
 
-    init_map(&test_map, &state)
+    init_map(&test_map, &current_state)
 
     fmt.print("\x1b[?1049h\x1b[?25l")
 
     for !quit {
-        draw_map(&state)
+        draw_map(&current_state)
 
-        if !process_keys(&state) {
+        input: Input
+
+        process_keys(&input)
+
+        if input.quit {
             quit = true
         }
 
-        update_exits(&state)
+        move := Position { 0, 0 }
+
+        if input.up {
+            move = { 0, -1 }
+        } else if input.down {
+            move = { 0, 1 }
+        } else if input.left {
+            move = { -1, 0 }
+        } else if input.right {
+            move = { 1, 0 }
+        }
+
+        if move != { 0, 0 } {
+            // store the current state prior to updates, if the move succeeds,
+            // store the previous state, otherwise continue
+            temp_state := current_state
+            if do_move(current_state.player, &current_state, move, nil) {
+                append(&history_states, temp_state)
+            }
+        }
+    
+        if input.reset {
+            init_map(current_state.map_data, &current_state)
+        }
+
+        if input.undo {
+            pop_state()
+        }
+
+        update_exits(&current_state)
 
         all_goals_enabled := true
-        for i in 0..<state.num_entities {
-            if state.entities[i].type == .Goal {
-                all_goals_enabled &&= state.entities[i].enabled
+        for i in 0..<current_state.num_entities {
+            if current_state.entities[i].type == .Goal {
+                all_goals_enabled &&= current_state.entities[i].enabled
             }
         }
 
         if all_goals_enabled {
-            state.solved = true
+            current_state.solved = true
 
-            if state.num_exits == 0 {
+            if current_state.num_exits == 0 {
                 win = true
                 quit = true
             }
         } else {
-            state.solved = false
+            current_state.solved = false
         }
 
-        if state.num_exits > 0 && state.player.overlapped_id > -1 {
-            if state.entities[state.player.overlapped_id].type == .Exit {
+        if current_state.num_exits > 0 && current_state.player.overlapped_id > -1 {
+            if current_state.entities[current_state.player.overlapped_id].type == .Exit {
                 win = true
                 quit = true
             }
@@ -329,8 +401,7 @@ main :: proc() {
     }
 
     // clear all formatting:
-    fmt.print("\x1b[39m\x1b[49m")
-    fmt.print("\x1b[?1049l")
+    fmt.print("\x1b[39m\x1b[49m\x1b[?25h\x1b[?1049l")
 
     quit_terminal()
 
