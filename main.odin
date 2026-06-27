@@ -1,7 +1,3 @@
-// 
-// 
-// 
-// 
 package main
 
 import "core:mem"
@@ -406,7 +402,9 @@ main :: proc() {
     quit := false
     win := false
 
-    alloc_err := virtual.arena_init_growing(&persistent_arena)
+    // TODO: This is temporary, a proper history system that doesn't just copy wholesale
+    // the map state would massively reduce memory usage.
+    alloc_err := virtual.arena_init_growing(&persistent_arena, size_of(Game_State))
 
     if alloc_err != nil {
         return
@@ -416,10 +414,16 @@ main :: proc() {
 
     history_states = make([dynamic]Game_State)
 
-    map_ok := load_sok("levels/Mini Cosmos.sok")
+    sok_file := "levels/test.txt"
+
+    if len(os.args) >= 2 {
+        sok_file = os.args[1]
+    }
+
+    map_ok := load_sok(sok_file)
 
     if !map_ok || len(map_list) == 0 {
-        fmt.eprintln("Failed to load test map.")
+        fmt.eprintln("Failed to load map.")
         return
     }
 
