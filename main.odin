@@ -4,16 +4,17 @@
 // 
 package main
 
-import "core:math/linalg"
 import "core:mem"
 import "core:mem/virtual"
 import "core:strings"
 import "core:fmt"
 import "core:os"
 
+import "vermin"
+
 Max_Maps :: 16 // or whatever
 Position :: distinct [2]int
-Max_Entities :: 64
+Max_Entities :: 1024
 Max_Map_Width :: 80
 Max_Map_Height :: 80
 
@@ -33,15 +34,17 @@ Game_State :: struct {
     num_boxes: u32,
     num_exits: u32,
     entities: [Max_Entities]Entity,
-    wall_data: [Max_Map_Width*Max_Map_Height]u8,
     entity_map: [Max_Map_Width*Max_Map_Height]int,
     map_data: ^Map_Data,
+    map_index: int,
     player: ^Entity, // short hand to get into the entity map, we always want to "do move" from the player entity out
-    moves: int,
+    num_moves: int,
+    num_pushes: int,
     solved: bool
 }
 
 Map_Data :: struct {
+    author, title: string,
     width, height: int, // largest width and height of the map row and column
     data: [Max_Map_Width*Max_Map_Height]u8
 }
@@ -66,65 +69,121 @@ Entity :: struct {
     flags: Entity_Flags_Set,
     id: int,
     overlapped_id: int,
-    enabled: bool
+    enabled: bool // fucking enabled?
 }
 
-// 
+// memory more or less persistent over the run of a map
 persistent_arena: virtual.Arena
 persistent_allocator: mem.Allocator
 history_states: [dynamic]Game_State
+map_list: [dynamic]Map_Data
 current_state: Game_State
 
-load_map :: proc(path: string) -> (bool, Map_Data) {
-    if !os.exists(path) {
-        return false, {}
+load_sok :: proc(path: string) -> bool {
+    valid_map_row :: proc(line: string) -> bool {
+        puzzle_elements := []u8{'#', 'x', '.', '$', 'b', '@', 'p', '+', 'P', '*', 'B', ' ', '-', '_'}
+
+        if len(line) == 0 {
+            return false
+        }
+
+        for r in line {
+            if strings.index_rune(string(puzzle_elements), r) < 0 {
+                return false
+            }
+        }
+
+        return true
     }
 
-    f, err := os.open(path)
+    // free all memory from any previously loaded map data including play history
+    mem.free_all(persistent_allocator)
+
+    err: mem.Allocator_Error
+    map_list, err = make([dynamic]Map_Data, persistent_allocator)
 
     if err != nil {
-        return false, {}
+        fmt.eprintln("Unable to allocate map list.")
+        return false
+    }
+
+    if !os.exists(path) {
+        fmt.eprintfln("Map file \"%s\" cannot be found.", path)
+        return false
+    }
+
+    f, f_err := os.open(path)
+
+    if f_err != nil {
+        fmt.eprintfln("Failed to load \"%s\".", path)
+        return false
     }
 
     data: []byte
-    data, err = os.read_entire_file(f, context.allocator)
+    data, f_err = os.read_entire_file(f, context.temp_allocator)
+    defer free_all(context.temp_allocator)
 
     if err != nil {
-        return false, {}
+        fmt.eprintfln("Unable to read data from \"%s\".", path)
+        return false
     }
 
-    defer delete(data)
-
-    str := cast(string)data
+    str := string(data)
 
     max_len := -1
     line_num := 0
     map_data: Map_Data
     map_data.data = ' '
+    in_map_data := false
 
     for line in strings.split_lines_iterator(&str) {
-        if max_len < 0 || max_len < len(line) {
-            max_len = len(line)
-        }
+        if valid_map_row(line) {
+            if len(line) >= Max_Map_Width {
+               fmt.eprintfln("Level data must be less than %d long per line.", Max_Map_Width)
+                return false
+            }
 
-        if len(line) >= Max_Map_Width {
-            fmt.eprintfln("Level data must be less than %d long per line.", Max_Map_Width)
-            return false, {}
-        }
+            if !in_map_data {
+                line_num = 0
+                in_map_data = true
+                max_len = -1
+                map_data = {}
+            }
 
-        c_count := 0
-        for c in line {
-            map_data.data[grid_index(c_count, line_num, Max_Map_Width)] = cast(u8)c
-            c_count += 1
-        }
+            if max_len < 0 || max_len < len(line) {
+                max_len = len(line)
+            }
 
-        line_num += 1
+            c_count := 0
+            for c in line {
+                map_data.data[grid_index(c_count, line_num, Max_Map_Width)] = cast(u8)c
+                c_count += 1
+            }
+
+            line_num += 1
+        } else if len(line) > 0 {
+            if strings.starts_with(line, "Author:") {
+                map_data.author = line[7:]
+            } else if strings.starts_with(line, "Title:") {
+                map_data.title = line[6:]
+            }
+        } else {
+            if in_map_data {
+                in_map_data = false
+                map_data.width = max_len
+                map_data.height = line_num
+                append(&map_list, map_data)
+            }
+        }
     }
 
-    map_data.width = max_len
-    map_data.height = line_num
+    if in_map_data {
+        map_data.width = max_len
+        map_data.height = line_num
+        append(&map_list, map_data)
+    }
 
-    return true, map_data
+    return true
 }
 
 grid_index_xy :: #force_inline proc(x, y, width: int) -> int {
@@ -174,25 +233,47 @@ update_exits :: proc(g: ^Game_State) {
     }
 }
 
-init_map :: proc(m: ^Map_Data, g: ^Game_State) {
-    g.wall_data = 0
+init_map :: proc(map_index: int, g: ^Game_State) -> bool{
     g.entities = {}
     g.entity_map = -1
-    g.moves = 0
+    g.num_moves = 0
     g.num_boxes = 0
     g.num_entities = 0
+    g.player = nil
 
-    g.map_data = m
+    if map_index >= len(map_list) {
+        return false
+    }
 
-    for y in 0..<m.height {
-        for x in 0..<m.width {
+    if g.map_index != map_index {
+        g.map_index = map_index
+        clear(&history_states)
+    }
+
+    g.map_data = &map_list[map_index]
+
+    for y in 0..<g.map_data.height {
+        for x in 0..<g.map_data.width {
             idx := grid_index(x, y, Max_Map_Width)
-            switch m.data[idx] {
-                case '#': g.wall_data[idx] = '#'
+            switch g.map_data.data[idx] {
                 case 'x': new_entity(g, .Exit, { x, y} , {})
                 case '.': new_entity(g, .Goal, {x, y}, { .Overlapped })
-                case '$': new_entity(g, .Box, {x, y})
-                case '@': g.player = new_entity(g, .Player, {x, y})
+                case '$': fallthrough
+                case 'b': new_entity(g, .Box, {x, y})
+                case '@': fallthrough
+                case 'p': g.player = new_entity(g, .Player, {x, y})
+                case '+': fallthrough
+                case 'P': {
+                    goal := new_entity(g, .Goal, {x, y}, {.Overlapped})
+                    g.player = new_entity(g, .Player, {x, y})
+                    g.player.overlapped_id = goal.id
+                }
+                case '*': fallthrough
+                case 'B': {
+                    goal := new_entity(g, .Goal, {x, y}, {.Overlapped})
+                    box := new_entity(g, .Box, {x, y})
+                    box.overlapped_id = goal.id
+                }
                 case:
             }
         }
@@ -200,6 +281,7 @@ init_map :: proc(m: ^Map_Data, g: ^Game_State) {
 
     // we store a known playable state
     append(&history_states, g^)
+    return true
 }
 
 draw_map :: proc(g: ^Game_State) {
@@ -214,7 +296,7 @@ draw_map :: proc(g: ^Game_State) {
             yy := (tdims[1] / 2) - g.map_data.height + y + 1
 
             // Draw walls:
-            if g.wall_data[idx] == '#' {
+            if g.map_data.data[idx] == '#' {
                 fmt.printf("\x1b[%d;%dH\x1b[48;2;150;41;56m\x1b[38;2;100;100;100m#\x1b[39m\x1b[49m", yy, xx)
             }
 
@@ -227,8 +309,20 @@ draw_map :: proc(g: ^Game_State) {
 
             if e != nil {
                 switch e.type {
-                    case .Player: fmt.printf("\x1b[%d;%dH\x1b[38;2;128;0;128m@\x1b[39m\x1b[49m", yy, xx)
-                    case .Box: fmt.printf("\x1b[%d;%dH\x1b[38;2;164;116;73m\x1b[48;2;78;53;36m%%\x1b[39m\x1b[49m", yy, xx)
+                    case .Player: {
+                        if e.overlapped_id > -1 && g.entities[e.overlapped_id].type == .Goal {
+                            fmt.printf("\x1b[%d;%dH\x1b[48;2;205;53;36m\x1b[38;2;128;0;128m@\x1b[39m\x1b[49m", yy, xx)
+                        } else {
+                            fmt.printf("\x1b[%d;%dH\x1b[38;2;128;0;128m@\x1b[39m\x1b[49m", yy, xx)
+                        }
+                    }
+                    case .Box: {
+                        if e.overlapped_id > -1 && g.entities[e.overlapped_id].type == .Goal {
+                            fmt.printf("\x1b[%d;%dH\x1b[38;2;200;216;73m\x1b[48;2;78;53;36m%%\x1b[39m\x1b[49m", yy, xx)
+                        } else {
+                            fmt.printf("\x1b[%d;%dH\x1b[38;2;164;116;73m\x1b[48;2;78;53;36m%%\x1b[39m\x1b[49m", yy, xx)
+                        }
+                    }
                     case .Goal: fmt.printf("\x1b[%d;%dH\x1b[38;2;255;165;0m!\x1b[39m\x1b[49m", yy, xx)
                     case .Exit: {
                         if g.solved {
@@ -252,7 +346,7 @@ pop_state :: proc() {
     current_state = pop(&history_states)
 }
 
-do_move :: proc(e: ^Entity, g: ^Game_State, move_dir: Position, f: ^Entity) -> bool {
+do_move :: proc(e: ^Entity, g: ^Game_State, move_dir: Position, force: ^Entity) -> bool {
     move_pos := e.position + move_dir 
     move_index :=  grid_index(move_pos, Max_Map_Width)
 
@@ -268,11 +362,11 @@ do_move :: proc(e: ^Entity, g: ^Game_State, move_dir: Position, f: ^Entity) -> b
         return false
     }
 
-    if g.wall_data[move_index] == '#' || (g.wall_data[move_index] == 'x' && !g.solved) {
+    if g.map_data.data[move_index] == '#' || (g.map_data.data[move_index] == 'x' && !g.solved) {
         return false
     }
 
-    if e.type == .Box && f.type != .Player {
+    if e.type == .Box && force.type != .Player {
         return false
     }
 
@@ -282,6 +376,7 @@ do_move :: proc(e: ^Entity, g: ^Game_State, move_dir: Position, f: ^Entity) -> b
         if !do_move(&g.entities[entity_id], g, move_dir, e) {
             return false
         }
+        g.num_pushes += 1
     }
 
     old_grid_idx := grid_index(e.position, Max_Map_Width)
@@ -296,7 +391,9 @@ do_move :: proc(e: ^Entity, g: ^Game_State, move_dir: Position, f: ^Entity) -> b
     e.overlapped_id = g.entity_map[move_index]
 
     if e.overlapped_id > -1 && g.entities[e.overlapped_id].type == .Goal {
-        g.entities[e.overlapped_id].enabled = true
+        if e.type == .Box {
+            g.entities[e.overlapped_id].enabled = true
+        }
     }
 
     e.position = move_pos
@@ -319,16 +416,21 @@ main :: proc() {
 
     history_states = make([dynamic]Game_State)
 
-    map_ok, test_map := load_map("levels/test.txt")
+    map_ok := load_sok("levels/Mini Cosmos.sok")
 
-    if !map_ok {
+    if !map_ok || len(map_list) == 0 {
         fmt.eprintln("Failed to load test map.")
         return
     }
 
+    // TODO: Implement vermin
+    // if !vermin.init() {
+    //     return
+    // }
+
     init_terminal()
 
-    init_map(&test_map, &current_state)
+    init_map(0, &current_state)
 
     fmt.print("\x1b[?1049h\x1b[?25l")
 
@@ -357,15 +459,20 @@ main :: proc() {
 
         if move != { 0, 0 } {
             // store the current state prior to updates, if the move succeeds,
-            // store the previous state, otherwise continue
+            // store the previous state, otherwise continue.
             temp_state := current_state
             if do_move(current_state.player, &current_state, move, nil) {
+                // TODO: Realistically the only state that changes between moves is
+                // the move count, and entity state. It would be smart to calculate
+                // the deltas between the moves and only store those in the history,
+                // instead of the whole struct
                 append(&history_states, temp_state)
+                current_state.num_moves += 1
             }
         }
     
         if input.reset {
-            init_map(current_state.map_data, &current_state)
+            init_map(current_state.map_index, &current_state)
         }
 
         if input.undo {
@@ -386,7 +493,6 @@ main :: proc() {
 
             if current_state.num_exits == 0 {
                 win = true
-                quit = true
             }
         } else {
             current_state.solved = false
@@ -395,7 +501,14 @@ main :: proc() {
         if current_state.num_exits > 0 && current_state.player.overlapped_id > -1 {
             if current_state.entities[current_state.player.overlapped_id].type == .Exit {
                 win = true
+            }
+        }
+
+        if win {
+            if !init_map(current_state.map_index + 1, &current_state) {
                 quit = true
+            } else {
+                win = false
             }
         }
     }
@@ -404,8 +517,4 @@ main :: proc() {
     fmt.print("\x1b[39m\x1b[49m\x1b[?25h\x1b[?1049l")
 
     quit_terminal()
-
-    if win {
-        fmt.print("Winner!")
-    }
 }

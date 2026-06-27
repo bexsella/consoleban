@@ -1,7 +1,6 @@
 package main
 
 import win32 "core:sys/windows"
-import "core:fmt"
 
 @(private)
 std_in_handle := win32.GetStdHandle(win32.STD_INPUT_HANDLE)
