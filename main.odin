@@ -8,11 +8,10 @@ import "core:os"
 
 import "vermin"
 
-Max_Maps :: 16 // or whatever
-Position :: distinct [2]int
+Position :: distinct [2]i16
 Max_Entities :: 1024
-Max_Map_Width :: 80
-Max_Map_Height :: 80
+Max_Map_Width :: 200
+Max_Map_Height :: 200
 
 // do this better, probably
 Input :: struct {
@@ -25,12 +24,17 @@ Input :: struct {
     quit: bool
 }
 
+Save_State :: struct {
+    indexes: []u16,
+    overlapped: []i16
+}
+
 Game_State :: struct {
-    num_entities: u32,
+    num_entities: i16,
     num_boxes: u32,
     num_exits: u32,
     entities: [Max_Entities]Entity,
-    entity_map: [Max_Map_Width*Max_Map_Height]int,
+    entity_map: [Max_Map_Width*Max_Map_Height]i16,
     map_data: ^Map_Data,
     map_index: int,
     player: ^Entity, // short hand to get into the entity map, we always want to "do move" from the player entity out
@@ -41,7 +45,7 @@ Game_State :: struct {
 
 Map_Data :: struct {
     author, title: string,
-    width, height: int, // largest width and height of the map row and column
+    width, height: u16, // largest width and height of the map row and column
     data: [Max_Map_Width*Max_Map_Height]u8
 }
 
@@ -52,7 +56,7 @@ Entity_Type :: enum {
     Exit,
 }
 
-Entity_Flags :: enum {
+Entity_Flags :: enum u8 {
     Moveable,
     Overlapped,
 }
@@ -63,15 +67,15 @@ Entity :: struct {
     type: Entity_Type,
     position: Position,
     flags: Entity_Flags_Set,
-    id: int,
-    overlapped_id: int,
-    enabled: bool // fucking enabled?
+    id: i16,
+    overlapped_id: i16,
+    activated: bool
 }
 
 // memory more or less persistent over the run of a map
 persistent_arena: virtual.Arena
 persistent_allocator: mem.Allocator
-history_states: [dynamic]Game_State
+history_states: [dynamic]^Save_State
 map_list: [dynamic]Map_Data
 current_state: Game_State
 
@@ -92,11 +96,8 @@ load_sok :: proc(path: string) -> bool {
         return true
     }
 
-    // free all memory from any previously loaded map data including play history
-    mem.free_all(persistent_allocator)
-
     err: mem.Allocator_Error
-    map_list, err = make([dynamic]Map_Data, persistent_allocator)
+    map_list, err = make([dynamic]Map_Data)
 
     if err != nil {
         fmt.eprintln("Unable to allocate map list.")
@@ -126,8 +127,8 @@ load_sok :: proc(path: string) -> bool {
 
     str := string(data)
 
-    max_len := -1
-    line_num := 0
+    max_len: u16 = 0
+    line_num: u16 = 0
     map_data: Map_Data
     map_data.data = ' '
     in_map_data := false
@@ -142,17 +143,17 @@ load_sok :: proc(path: string) -> bool {
             if !in_map_data {
                 line_num = 0
                 in_map_data = true
-                max_len = -1
+                max_len = 0
                 map_data = {}
             }
 
-            if max_len < 0 || max_len < len(line) {
-                max_len = len(line)
+            if max_len == 0 || max_len < cast(u16)len(line) {
+                max_len = cast(u16)len(line)
             }
 
-            c_count := 0
+            c_count: i16 = 0
             for c in line {
-                map_data.data[grid_index(c_count, line_num, Max_Map_Width)] = cast(u8)c
+                map_data.data[grid_index(c_count, cast(i16)line_num, Max_Map_Width)] = cast(u8)c
                 c_count += 1
             }
 
@@ -173,6 +174,7 @@ load_sok :: proc(path: string) -> bool {
         }
     }
 
+    // add last map, if any:
     if in_map_data {
         map_data.width = max_len
         map_data.height = line_num
@@ -182,11 +184,11 @@ load_sok :: proc(path: string) -> bool {
     return true
 }
 
-grid_index_xy :: #force_inline proc(x, y, width: int) -> int {
-    return x + width * y
+grid_index_xy :: #force_inline proc(x, y, width: i16) -> int {
+    return cast(int)(x + width * y)
 }
 
-grid_index_pos :: #force_inline proc(position: Position, width: int) -> int {
+grid_index_pos :: #force_inline proc(position: Position, width: i16) -> int {
     return grid_index(position[0], position[1], width)
 }
 
@@ -204,9 +206,9 @@ new_entity :: proc(g: ^Game_State, type: Entity_Type, position: Position, flags:
     e.type = type
     e.flags = flags
     e.position = position
-    e.id = cast(int)g.num_entities
+    e.id = g.num_entities
     e.overlapped_id = -1
-    e.enabled = false
+    e.activated = false
 
     g.entity_map[grid_index(position, Max_Map_Width)] = e.id
     g.num_entities += 1
@@ -242,32 +244,36 @@ init_map :: proc(map_index: int, g: ^Game_State) -> bool{
     }
 
     if g.map_index != map_index {
+        // TODO: We should reset the persistent allocator here, but we don't
+        // because it now holds the map data for all loaded maps, it shouldn't.
         g.map_index = map_index
         clear(&history_states)
+        free_all(persistent_allocator)
     }
 
     g.map_data = &map_list[map_index]
 
     for y in 0..<g.map_data.height {
         for x in 0..<g.map_data.width {
-            idx := grid_index(x, y, Max_Map_Width)
+            pos := Position{cast(i16)x, cast(i16)y}
+            idx := grid_index(pos, Max_Map_Width)
             switch g.map_data.data[idx] {
-                case 'x': new_entity(g, .Exit, { x, y} , {})
-                case '.': new_entity(g, .Goal, {x, y}, { .Overlapped })
+                case 'x': new_entity(g, .Exit, pos, {})
+                case '.': new_entity(g, .Goal, pos, { .Overlapped })
                 case '$': fallthrough
-                case 'b': new_entity(g, .Box, {x, y})
+                case 'b': new_entity(g, .Box, pos)
                 case '@': fallthrough
-                case 'p': g.player = new_entity(g, .Player, {x, y})
+                case 'p': g.player = new_entity(g, .Player, pos)
                 case '+': fallthrough
                 case 'P': {
-                    goal := new_entity(g, .Goal, {x, y}, {.Overlapped})
-                    g.player = new_entity(g, .Player, {x, y})
+                    goal := new_entity(g, .Goal, pos, {.Overlapped})
+                    g.player = new_entity(g, .Player, pos)
                     g.player.overlapped_id = goal.id
                 }
                 case '*': fallthrough
                 case 'B': {
-                    goal := new_entity(g, .Goal, {x, y}, {.Overlapped})
-                    box := new_entity(g, .Box, {x, y})
+                    goal := new_entity(g, .Goal, pos, {.Overlapped})
+                    box := new_entity(g, .Box, pos)
                     box.overlapped_id = goal.id
                 }
                 case:
@@ -275,8 +281,6 @@ init_map :: proc(map_index: int, g: ^Game_State) -> bool{
         }
     }
 
-    // we store a known playable state
-    append(&history_states, g^)
     return true
 }
 
@@ -287,9 +291,10 @@ draw_map :: proc(g: ^Game_State) {
 
     for y in 0..<g.map_data.height {
         for x in 0..<g.map_data.width {
-            idx := grid_index(x, y, Max_Map_Width)
-            xx := (tdims[0] / 2) - g.map_data.width + x + 1
-            yy := (tdims[1] / 2) - g.map_data.height + y + 1
+            idx := grid_index(cast(i16)x, cast(i16)y, Max_Map_Width)
+
+            xx := (tdims[0] / 2) - (cast(int)g.map_data.width / 2) + cast(int)x
+            yy := (tdims[1] / 2) - (cast(int)g.map_data.height / 2) + cast(int)y
 
             // Draw walls:
             if g.map_data.data[idx] == '#' {
@@ -333,13 +338,54 @@ draw_map :: proc(g: ^Game_State) {
     }
 }
 
-pop_state :: proc() {
-    if len(history_states) == 1 {
-        current_state = history_states[0]
-        return
+create_state :: proc(g: ^Game_State) -> ^Save_State {
+    save_state := new(Save_State, persistent_allocator)
+    save_state.indexes = make([]u16, g.num_entities, persistent_allocator)
+    save_state.overlapped = make([]i16, g.num_entities, persistent_allocator)
+
+    for i in 0..<g.num_entities {
+        save_state.indexes[i] = cast(u16)(grid_index(g.entities[i].position, Max_Map_Width))
+        save_state.overlapped[i] = g.entities[i].overlapped_id
     }
 
-    current_state = pop(&history_states)
+    return save_state
+}
+
+update_state :: proc(g: ^Game_State, s: ^Save_State) {
+    for i in 0..<g.num_entities {
+        s.indexes[i] = cast(u16)(grid_index(g.entities[i].position, Max_Map_Width))
+        s.overlapped[i] = g.entities[i].overlapped_id
+    }
+}
+
+pop_state :: proc(g: ^Game_State) {
+    prev_state: ^Save_State
+
+    if len(history_states) == 1 {
+        prev_state = history_states[0]
+    } else {
+        prev_state = pop(&history_states)
+    }
+
+    g.entity_map = -1
+
+    for i in 0..<g.num_entities {
+        if g.entities[i].type != .Goal {
+            g.entity_map[prev_state.indexes[i]] = i
+        } else if prev_state.overlapped[i] == -1 {
+            g.entity_map[prev_state.indexes[i]] = i
+            g.entities[i].activated = false
+        }
+
+        g.entities[i].position = { cast(i16)(prev_state.indexes[i] % Max_Map_Width), cast(i16)(prev_state.indexes[i] / Max_Map_Width) }
+        g.entities[i].overlapped_id = prev_state.overlapped[i]
+
+        if prev_state.overlapped[i] > -1 {
+            if g.entities[prev_state.overlapped[i]].type == .Goal {
+                g.entities[prev_state.overlapped[i]].activated = true
+            }
+        }
+    }
 }
 
 do_move :: proc(e: ^Entity, g: ^Game_State, move_dir: Position, force: ^Entity) -> bool {
@@ -347,6 +393,7 @@ do_move :: proc(e: ^Entity, g: ^Game_State, move_dir: Position, force: ^Entity) 
     move_index :=  grid_index(move_pos, Max_Map_Width)
 
     if .Overlapped in e.flags {
+        e.overlapped_id = force.id
         return true
     }
 
@@ -380,15 +427,20 @@ do_move :: proc(e: ^Entity, g: ^Game_State, move_dir: Position, force: ^Entity) 
     // if we've overlapped an entity previously, we set the current pos to that overlapped id,
     // and if we're about to overlap an entity, we store that as the new overlap id
     if e.overlapped_id > -1 {
-        g.entities[e.overlapped_id].enabled = false
+        g.entities[e.overlapped_id].activated = false
     }
 
     g.entity_map[old_grid_idx] = e.overlapped_id
+
+    if e.overlapped_id > -1 {
+        g.entities[e.overlapped_id].overlapped_id = -1
+    }
+
     e.overlapped_id = g.entity_map[move_index]
 
     if e.overlapped_id > -1 && g.entities[e.overlapped_id].type == .Goal {
         if e.type == .Box {
-            g.entities[e.overlapped_id].enabled = true
+            g.entities[e.overlapped_id].activated = true
         }
     }
 
@@ -402,9 +454,7 @@ main :: proc() {
     quit := false
     win := false
 
-    // TODO: This is temporary, a proper history system that doesn't just copy wholesale
-    // the map state would massively reduce memory usage.
-    alloc_err := virtual.arena_init_growing(&persistent_arena, size_of(Game_State))
+    alloc_err := virtual.arena_init_growing(&persistent_arena, size_of(Save_State))
 
     if alloc_err != nil {
         return
@@ -412,7 +462,7 @@ main :: proc() {
 
     persistent_allocator = virtual.arena_allocator(&persistent_arena)
 
-    history_states = make([dynamic]Game_State)
+    history_states = make([dynamic]^Save_State)
 
     sok_file := "levels/test.txt"
 
@@ -435,6 +485,9 @@ main :: proc() {
     init_terminal()
 
     init_map(0, &current_state)
+
+    // store current positions of the entities
+    current_save := create_state(&current_state)
 
     fmt.print("\x1b[?1049h\x1b[?25l")
 
@@ -462,16 +515,11 @@ main :: proc() {
         }
 
         if move != { 0, 0 } {
-            // store the current state prior to updates, if the move succeeds,
-            // store the previous state, otherwise continue.
-            temp_state := current_state
             if do_move(current_state.player, &current_state, move, nil) {
-                // TODO: Realistically the only state that changes between moves is
-                // the move count, and entity state. It would be smart to calculate
-                // the deltas between the moves and only store those in the history,
-                // instead of the whole struct
-                append(&history_states, temp_state)
+                // store the previous position, and create new state
+                append(&history_states, current_save)
                 current_state.num_moves += 1
+                current_save = create_state(&current_state)
             }
         }
     
@@ -480,7 +528,7 @@ main :: proc() {
         }
 
         if input.undo {
-            pop_state()
+            pop_state(&current_state)
         }
 
         update_exits(&current_state)
@@ -488,7 +536,7 @@ main :: proc() {
         all_goals_enabled := true
         for i in 0..<current_state.num_entities {
             if current_state.entities[i].type == .Goal {
-                all_goals_enabled &&= current_state.entities[i].enabled
+                all_goals_enabled &&= current_state.entities[i].activated
             }
         }
 
